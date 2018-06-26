@@ -1,3 +1,18 @@
+# 7.0.0 (06/26/2018)
+
+Fork from https://github.com/claranet/terraform-wrapper
+
+Notable differences with upstream :
+
+  * Exploit partial backend configuration feature of Terraform
+  * Simplify stack schema
+  * Determine AWS account ID with sts:GetCallerIdentity
+  * Get closer to Terraform native behavior (only init and get subcommands are slightly different)
+  * Remove azure support
+  * Remove terrafom versionning support
+
+Tested with Terraform version 0.11
+
 # 6.1.1 (15/03/2018)
 
 UPDATES :
