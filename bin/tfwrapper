@@ -1,344 +1,85 @@
 #!/usr/bin/env python3
 """Python wrapper for Terraform."""
 
-import argparse
-import codecs
-import json
 import os
-import pickle
-import random
-import re
-import shutil
-import stat
-import string
-import subprocess
-import tempfile
-import time
 import sys
-import zipfile
-from copy import deepcopy
-from datetime import datetime
-from pathlib import Path
-
-import boto3
-import botocore
-import jinja2
-import requests
+from subprocess import Popen
+import json
 import yaml
+import argparse
+from copy import deepcopy
+from pathlib import Path
 from schema import Schema, SchemaError, Optional
 from termcolor import colored
+from botocore.credentials import JSONFileCache
+from botocore.exceptions import ClientError, BotoCoreError, ProfileNotFound
+import botocore.session
+import boto3
 
-RC_OK = 0
-RC_KO = 1
-RC_UNK = 2
+DEFAULT_CONFDIR='.wrapper.d'
 
-home_dir = str(Path.home())
+WRAPPER_CONFIG_SCHEMA = {
+    'profile': str,
+    'region': str,
+    'bucket': str,
+    'dynamodb_table': str
+}
 
-stack_configuration_schema = Schema({
-    Optional('aws'): {
-        'general': {
-            'account': str,
-            'region': str
-        },
-        'credentials':{
-            'profile': str,
+STACK_CONFIG_SCHEMA = {
+    'profile': str,
+    'partition': str,
+    Optional('terraform'): {
+        Optional('vars'): {
+            str: str
         }
-    },
-    Optional('azure'): {
-        'general': {
-            'mode': str,
-            'subscription_id': str,
-            'directory_id': str
-        },
-        Optional('credential'): {
-            'profile': str
-        }
-    },
-    'terraform': {
-        'vars': {str: str}
     }
-})
+}
 
-def load_wrapper_config(args):
-    """Load wrapper config from args. Validate args and autodetect current stack."""
-    # convert args to dict
-    wrapper_config = deepcopy(vars(args))
-
-    # detect confdir and rootdir locations
-    parents_count = 0
-    while parents_count < 5:
-        if os.path.isdir('../' * parents_count + wrapper_config['confdir']):
-            wrapper_config['confdir'] = '../' * parents_count + wrapper_config['confdir']
-            break
-        parents_count += 1
-
-    if parents_count == 5:
-        raise ValueError("Cannot find configuration directory '%s' in this directory or above" % wrapper_config['confdir'])
-
-    wrapper_config['rootdir'] = os.path.dirname(os.path.abspath(wrapper_config['confdir']))
-
-    # detect parent dirs
-    count_up = 0
-    count_down = parents_count
-
-    # check wether we are in global environment
-    if (os.path.basename(os.path.abspath('.')) == '_global' or
-            os.path.basename(os.path.abspath('..')) == '_global' or
-            wrapper_config['environment'] == 'global'):
-        parents_list = ['account', 'environment', 'stack']
-    else:
-        parents_list = ['account', 'environment', 'region', 'stack']
-
-    # detect dirs
-    while count_down > 0:
-        if wrapper_config[parents_list[count_up]] is None:
-            wrapper_config[parents_list[count_up]] = os.path.basename(os.path.abspath('./' + '../' * (count_down - 1)))
-        count_down -= 1
-        count_up += 1
-
-    for element in parents_list:
-        if wrapper_config[element] is None:
-            raise ValueError("%s cannot be autodetected. Exiting..." % element)
-
-    # support both _global (fs) and global (param)
-    if wrapper_config['environment'] == '_global':
-        wrapper_config['environment'] = 'global'
-
-    # load state configuration
-    with open(wrapper_config['confdir'] + '/state.yml', 'r') as f:
-        state_config = yaml.load(f)
-
-    wrapper_config['state_account'] = state_config['aws']['general']['account']
-    wrapper_config['state_region'] = state_config['aws']['general']['region']
-    wrapper_config['state_profile'] = state_config['aws']['credentials']['profile']
-
-    return wrapper_config
+WRAPPER_SUBCOMMANDS = [
+    'apply',
+    'console',
+    'destroy',
+    'fmt',
+    'force-unlock',
+    'get',
+    'graph',
+    'import',
+    'init',
+    'output',
+    'plan',
+    'providers',
+    'push',
+    'refresh',
+    'show',
+    'state',
+    'taint',
+    'untaint',
+    'validate',
+    'version',
+    'workspace'
+]
 
 
-def load_stack_config(confdir, account, environment, region, stack):
-    """Load configuration from YAML file."""
-    if environment == 'global':
-        stack_config_file = '{}/{}_global_{}.yml'.format(confdir, account, stack)
-    else:
-        stack_config_file = '{}/{}_{}_{}_{}.yml'.format(confdir, account, environment, region, stack)
-
-    with open(stack_config_file, 'r') as f:
-        stack_config = yaml.load(f)
-
-    try:
-        stack_configuration_schema.validate(stack_config)
-    except SchemaError as e :
-        print(colored('Configuration error in {} :'.format(stack_config_file), 'red'), file=sys.stderr)
-        print(e, file=sys.stderr)
-        sys.exit(RC_KO)
-
-    return stack_config
-
-
-def get_session(rootdir, account, region, profile):
-    """Get or create cached session."""
-    session_cache_file = '{}/.run/session_cache_{}_{}.pickle'.format(rootdir, account, profile)
-
-    if (os.path.isfile(session_cache_file) and
-            time.time() - os.stat(session_cache_file).st_mtime < 2700):
-        with open(session_cache_file, 'rb') as f:
-            session_cache = pickle.load(f)
-        session = boto3.Session(aws_access_key_id=session_cache['credentials'].access_key,
-                                aws_secret_access_key=session_cache['credentials'].secret_key,
-                                aws_session_token=session_cache['credentials'].token,
-                                region_name=session_cache['region'])
-    else:
-        try:
-            session = boto3.Session(profile_name=profile, region_name=region)
-        except botocore.exceptions.ProfileNotFound:
-            print("Profile %s not found. Exiting..." % profile, file=sys.stderr)
-            sys.exit(RC_KO)
-        try:
-            session_cache = {'credentials': session.get_credentials().get_frozen_credentials(),
-                             'region': session.region_name}
-        except botocore.exceptions.ParamValidationError:
-            print('Error validating authentication. Maybe the wrong MFA code ?', file=sys.stderr)
-            sys.exit(RC_KO)
-        except Exception as e:
-            print('Unknown error :', file=sys.stderr)
-            print(e, file=sys.stderr)
-            sys.exit(RC_UNK)
-        with os.fdopen(os.open(session_cache_file, os.O_WRONLY | os.O_CREAT,
-                               mode=0o600), 'wb') as f:
-            pickle.dump(session_cache, f, pickle.HIGHEST_PROTOCOL)
-
+def get_cached_session(**kwargs):
+    botocore_session = botocore.session.get_session()
+    kwargs['botocore_session'] = botocore_session
+    session = boto3.session.Session(**kwargs)
+    botocore_session.get_component('credential_provider').get_provider('assume-role').cache = JSONFileCache()
     return session
 
 
-def set_terraform_vars(vars):
-    """Configure Terraform env."""
-    for var, value in vars.items():
-        if value is not None:
-            os.environ['TF_VAR_{}'.format(var)] = str(value)
-
-
-def get_stack_path(wrapper_config, local=False):
-    """Return stack path."""
-    rootdir = wrapper_config['rootdir']
-    account = wrapper_config['account']
-    environment = wrapper_config['environment']
-    region = wrapper_config['region']
-    stack = wrapper_config['stack']
-
-    if local:
-        if environment == 'global':
-            stack_path = '{}/{}/_global/{}'.format(rootdir, account, stack)
-        else:
-            stack_path = '{}/{}/{}/{}/{}'.format(rootdir, account, environment, region, stack)
-    else:
-        if environment == 'global':
-            stack_path = '{}/_global/{}'.format(account, stack)
-        else:
-            stack_path = '{}/{}/{}/{}'.format(account, environment, region, stack)
-
-    return stack_path
-
-
-def bootstrap(wrapper_config):
-    """Bootstrap project."""
-    rootdir = wrapper_config['rootdir']
-    confdir = wrapper_config['confdir']
-    stack_path = get_stack_path(wrapper_config, local=True)
-
-    account = wrapper_config['account']
-    environment = wrapper_config['environment']
-    region = wrapper_config['region']
-    stack = wrapper_config['stack']
-
-    stack_config = load_stack_config(confdir, account, environment, region, stack)
-    tf_version = stack_config['terraform']['vars'].get('version')
-    if tf_version:
-        do_switchver(tf_version)
-
-    # bootstrap Terraform files from stack template
-    if not os.path.isdir(stack_path):
-        if wrapper_config.get('template') is None:
-            if environment == 'global':
-                template = 'global'
-            else:
-                template = 'basic'
-        else:
-            template = wrapper_config['template']
-
-        shutil.copytree('{}/templates/{}'.format(rootdir, template), stack_path)
-
-    # boostrap state.tf from jinja2 template
-    if not os.path.isfile('{}/state.tf'.format(stack_path)):
-        client_name = stack_config['terraform']['vars']['client_name']
-
-        jinja2_env = jinja2.Environment(
-            loader=jinja2.FileSystemLoader('{}/templates/common'.format(rootdir)))
-
-        state_conf = jinja2_env.get_template('state.tf.jinja2').render(
-            client_name=client_name,
-            account=account,
-            environment=environment,
-            region=region,
-            stack=stack)
-
-        with open('{}/state.tf'.format(stack_path), "w") as f:
-            f.write(state_conf)
-
-        return run_terraform('init', wrapper_config)
-
-
-def do_switchver(version):
-    """
-    Switch to desired terraform version if different from current one
-    :param version: string: desired terraform version
-    """
-    m = re.match(r'^([0-9]+.[0-9]+).?([0-9]+)?$', version)
-    if not m:
-        raise ValueError('The terraform version seems not correct, it should be a version number like "X.Y" or "X.Y.Z"')
-    minor_version, patch = m.groups()
-
-    # Checking version existence and getting latest patch version if not defined
-    found = False
-    releases = requests.get('https://api.github.com/repos/hashicorp/terraform/releases').json()
-    for release in releases:
-        if re.match(r'^v{}\.{}$'.format(minor_version, patch if patch else '[0-9]+'), release['tag_name']):
-            found = True
-            patch = patch or release['tag_name'].split('.')[-1]
-            break
-
-    if not found:
-        raise ValueError("The terraform version {} does not exist".format(version))
-
-    full_version = "{}.{}".format(minor_version, patch)
-
-    # Getting current version
-    try:
-        p = subprocess.run(['terraform', '-v'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        current_version = re.match(r'^Terraform v([0-9]+.[0-9]+.[0-9]+)', p.stdout.decode('ascii')).group(1)
-    except FileNotFoundError:
-        current_version = 'not installed'
-
-    if current_version == full_version:
-        print("Terraform is already on version {}".format(full_version))
-        return
-
-    print("Current terraform version is {}, switching to version {}".format(current_version, full_version))
-
-    version_path = os.path.expanduser(os.path.join('~/.terraform.d/versions', minor_version, full_version))
-    tf_bin_path = os.path.join(version_path, 'terraform')
-    local_tf_bin_path = os.path.join(os.path.dirname(__file__), 'terraform')
-    os.makedirs(version_path, exist_ok=True)
-
-    if not os.path.isfile(tf_bin_path):
-        # Download and extract in user's home if needed
-        print("Version does not exist locally, downloading it")
-        handle, tmp_file = tempfile.mkstemp(prefix='terraform-', suffix='.zip')
-        r = requests.get(
-            'https://releases.hashicorp.com/terraform/{full_version}/terraform_{full_version}_linux_amd64.zip'.format(
-                full_version=full_version),
-            stream=True)
-        with open(tmp_file, 'wb') as fd:
-            for chunk in r.iter_content(chunk_size=128):
-                fd.write(chunk)
-        with zipfile.ZipFile(tmp_file, 'r') as zip:
-            zip.extractall(path=version_path)
-        # Permissions not preserved on extract https://bugs.python.org/issue15795
-        os.chmod(tf_bin_path, os.stat(tf_bin_path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-        os.remove(tmp_file)
-
-    # Doing symlink
-    if os.path.islink(local_tf_bin_path):
-        os.remove(local_tf_bin_path)
-    os.symlink(tf_bin_path, local_tf_bin_path)
-
-    print("Switch done, current terraform version is {}".format(full_version))
-
-
-def run_terraform(action, wrapper_config):
+def run_terraform(action, context):
     """Run Terraform command."""
-    rootdir = wrapper_config['rootdir']
-
-    tf_params = wrapper_config.get('tf_params')
-    account = wrapper_config['account']
-    environment = wrapper_config['environment']
-    region = wrapper_config['region']
-    stack = wrapper_config['stack']
-
     # support for custom parameters
     command = ["terraform", action]
-    if tf_params is not None:
-        if tf_params and tf_params[0] == '--':
-            tf_params = tf_params[1:]
-        command += tf_params
 
-    working_dir = ('{}/{}/_global/{}'.format(rootdir, account, stack) if environment == 'global'
-                   else '{}/{}/{}/{}/{}'.format(rootdir, account, environment, region, stack))
+    params = context['params']
+    if len(params) > 0 and params[0] == '--':
+        params.pop(0)
+    command.extend(params)
 
-    cmd_env = deepcopy(os.environ)
-    cmd_env['PATH'] = "{path}{sep}{old_path}".format(
-        path=os.path.dirname(__file__), sep=os.pathsep, old_path=cmd_env.get('PATH', ''))
-
-    with subprocess.Popen(command, cwd=working_dir, env=cmd_env) as process:
+    cwd = Path(context['rootdir'], context['application'], context['environment'], context['region'], context['stack'])
+    with Popen(command, cwd=str(cwd)) as process:
         try:
             process.communicate()
         except:
@@ -348,168 +89,140 @@ def run_terraform(action, wrapper_config):
         return process.poll()
 
 
-def terraform_apply(wrapper_config):
+def terraform_apply(context):
     """Terraform apply wrapper function."""
-    bootstrap(wrapper_config)
-
-    # do not force plan if unsafe
-    if wrapper_config['unsafe']:
-        return run_terraform('apply', wrapper_config)
-    else:
-        # plan config
-        plan_path = '{}/.run/plan_{}'.format(wrapper_config['rootdir'],
-                                             ''.join(random.choice(string.ascii_letters) for x in range(10)))
-        plan_wrapper_config = deepcopy(wrapper_config)
-        plan_wrapper_config['tf_params'][1:1] = ['-out', plan_path]
-        plan_return_code = run_terraform('plan', plan_wrapper_config)
-
-        # return Terraform return code if plan fails
-        if plan_return_code > 0:
-            return plan_return_code
-
-        # ask for confirmation
-        colored_account = colored(plan_wrapper_config['account'], 'yellow')
-        colored_environment = colored(plan_wrapper_config['environment'], 'red')
-        colored_region = colored(plan_wrapper_config['region'], 'blue')
-        colored_stack = colored(plan_wrapper_config['stack'], 'green')
-
-        if plan_wrapper_config['environment'] == 'global':
-            env_msg = '''
-    Account : {}
-Environment : {}
-      Stack : {}
-            '''.format(colored_account, colored_environment, colored_stack)
-        else:
-            env_msg = '''
-    Account : {}
-Environment : {}
-     Region : {}
-      Stack : {}
-            '''.format(colored_account, colored_environment, colored_region, colored_stack)
-
-        print('\nDo you really want to apply this plan on the following stack ?', file=sys.stderr)
-        print(env_msg, file=sys.stderr)
-        apply_input = input("'yes' to confirm : ")
-
-        try:
-            if apply_input == 'yes':
-                # apply config
-                apply_wrapper_config = deepcopy(wrapper_config)
-                apply_wrapper_config['tf_params'].append(plan_path)
-                apply_return_code = run_terraform('apply', apply_wrapper_config)
-
-                return apply_return_code
-            else:
-                print('\nAborting apply.', file=sys.stderr)
-        finally:
-            # delete plan
-            os.remove(plan_path)
+    return run_terraform('apply', context)
 
 
-def terraform_console(wrapper_config):
+def terraform_console(context):
     """Terraform console wrapper function."""
-    return run_terraform('console', wrapper_config)
+    return run_terraform('console', context)
 
 
-def terraform_destroy(wrapper_config):
+def terraform_destroy(context):
     """Terraform destroy wrapper function."""
-    return run_terraform('destroy', wrapper_config)
+    return run_terraform('destroy', context)
 
 
-def terraform_fmt(wrapper_config):
+def terraform_fmt(context):
     """Terraform fmt wrapper function."""
-    return run_terraform('fmt', wrapper_config)
+    return run_terraform('fmt', context)
 
 
-def terraform_force_unlock(wrapper_config):
+def terraform_force_unlock(context):
     """Terraform force-unlock wrapper function."""
-    return run_terraform('force-unlock', wrapper_config)
+    return run_terraform('force-unlock', context)
 
 
-def terraform_get(wrapper_config):
+def terraform_get(context):
     """Terraform get wrapper function."""
     # force update
-    if not any('-update' in x for x in wrapper_config['tf_params']):
-        wrapper_config['tf_params'][1:1] = ['-update']
-
-    # call subcommand
-    return run_terraform('get', wrapper_config)
+    context['params'].append('-update=true')
+    return run_terraform('get', context)
 
 
-def terraform_graph(wrapper_config):
+def terraform_graph(context):
     """Terraform graph wrapper function."""
-    return run_terraform('graph', wrapper_config)
+    return run_terraform('graph', context)
 
 
-def terraform_import(wrapper_config):
+def terraform_import(context):
     """Terraform import wrapper function."""
-    return run_terraform('import', wrapper_config)
+    return run_terraform('import', context)
 
 
-def terraform_init(wrapper_config):
+def terraform_init(context):
     """Terraform init wrapper function."""
-    return run_terraform('init', wrapper_config)
+    
+    backend_config = {
+        'region': context['state_config']['region'],
+        'bucket': context['state_config']['bucket'],
+        'key': '{}/{}/{}/{}/{}/terraform.state'.format(context['stack_config']['partition'],
+                                                       context['application'],
+                                                       context['environment'],
+                                                       context['region'],
+                                                       context['stack']),
+        'dynamodb_table': context['state_config']['dynamodb_table']
+    }
+
+    for k,v in backend_config.items():
+        context['params'].append('-backend-config={}={}'.format(k, v))
+
+    return run_terraform('init', context)
 
 
-def terraform_output(wrapper_config):
+def terraform_output(context):
     """Terraform output wrapper function."""
-    return run_terraform('output', wrapper_config)
+    return run_terraform('output', context)
 
 
-def terraform_plan(wrapper_config):
+def terraform_plan(context):
     """Terraform plan wrapper function."""
-    bootstrap(wrapper_config)
-    return run_terraform('plan', wrapper_config)
+    return run_terraform('plan', context)
+
+def terraform_providers(context):
+    """Terraform providers wrapper function."""
+    return run_terraform('providers', context)
 
 
-def terraform_refresh(wrapper_config):
+def terraform_push(context):
+    """Terraform push wrapper function."""
+    return run_terraform('push', context)
+
+
+def terraform_refresh(context):
     """Terraform refresh wrapper function."""
-    return run_terraform('refresh', wrapper_config)
+    return run_terraform('refresh', context)
 
 
-def terraform_show(wrapper_config):
+def terraform_show(context):
     """Terraform show wrapper function."""
-    return run_terraform('show', wrapper_config)
+    return run_terraform('show', context)
 
 
-def terraform_state(wrapper_config):
+def terraform_state(context):
     """Terraform state wrapper function."""
-    return run_terraform('state', wrapper_config)
+    return run_terraform('state', context)
 
 
-def terraform_taint(wrapper_config):
+def terraform_taint(context):
     """Terraform taint wrapper function."""
-    return run_terraform('taint', wrapper_config)
+    return run_terraform('taint', context)
 
 
-def terraform_untaint(wrapper_config):
+def terraform_untaint(context):
     """Terraform untaint wrapper function."""
-    return run_terraform('untaint', wrapper_config)
+    return run_terraform('untaint', context)
 
 
-def terraform_validate(wrapper_config):
+def terraform_validate(context):
     """Terraform validate wrapper function."""
-    return run_terraform('validate', wrapper_config)
+    return run_terraform('validate', context)
 
 
-def switchver(wrapper_config):
-    """Switch terraform version command"""
-    version = wrapper_config.get('version')[0]
-    do_switchver(version)
+def terraform_version(context):
+    """Terraform version wrapper function."""
+    return run_terraform('version', context)
+
+
+def terraform_workspace(context):
+    """Terraform workspace wrapper function."""
+    return run_terraform('workspace', context)
 
 
 def main():
     """Main function."""
     # terraforms params doc
-    tf_params_help = 'Any Terraform parameters after a "--" delimiter'
+    params_help = 'Any Terraform parameters after a "--" delimiter'
 
     # argparse
     parser = argparse.ArgumentParser(description='Terraform wrapper.')
-    parser.add_argument('-c', '--confdir',
-                        help='Configuration directory. Used to detect the project root. Defaults to conf.',
-                        default='conf')
-    parser.add_argument('-a', '--account',
-                        help='Target account. Autodetected if none is provided.',
+    parser.add_argument('-c', '--configuration-directory',
+                        help='Configuration file. Used to detect the project root. Defaults to {}.'.format(DEFAULT_CONFDIR),
+                        default=DEFAULT_CONFDIR,
+                        dest='confdir')
+    parser.add_argument('-a', '--application',
+                        help='Target application. Autodetected if none is provided.',
                         nargs='?')
     parser.add_argument('-e', '--environment',
                         help='Target environment. Autodetected if none is provided.',
@@ -517,266 +230,137 @@ def main():
     parser.add_argument('-r', '--region',
                         help='Target region. Autodetected if none is provided.',
                         nargs='?')
-    parser.add_argument('-s', '--stack', help='Target stack. Autodetected if none is provided.',
+    parser.add_argument('-s', '--stack',
+                        help='Target stack. Autodetected if none is provided.',
                         nargs='?')
-    parser.add_argument('-p', '--plugin-cache-dir', help='Plugins cache directory.',
-                        default='{}/.terraform.d/plugin-cache'.format(home_dir))
 
     subparsers = parser.add_subparsers(dest='subcommand', help='subcommands')
-
-    parser_apply = subparsers.add_parser('apply', help='terraform apply')
-    parser_apply.set_defaults(func=terraform_apply)
-    parser_apply.add_argument('-u', '--unsafe',
-                              help='Do not force plan and human interaction before apply.',
-                              action='store_true', default=False)
-    parser_apply.add_argument('tf_params', nargs=argparse.REMAINDER, help=tf_params_help)
-
-    parser_console = subparsers.add_parser('console', help='terraform console')
-    parser_console.set_defaults(func=terraform_console)
-    parser_console.add_argument('tf_params', nargs=argparse.REMAINDER, help=tf_params_help)
-
-    parser_destroy = subparsers.add_parser('destroy', help='terraform destroy')
-    parser_destroy.set_defaults(func=terraform_destroy)
-    parser_destroy.add_argument('tf_params', nargs=argparse.REMAINDER, help=tf_params_help)
-
-    parser_fmt = subparsers.add_parser('fmt', help='terraform fmt')
-    parser_fmt.set_defaults(func=terraform_fmt)
-    parser_fmt.add_argument('tf_params', nargs=argparse.REMAINDER, help=tf_params_help)
-
-    parser_force_unlock = subparsers.add_parser('force-unlock', help='terraform force-unlock')
-    parser_force_unlock.set_defaults(func=terraform_force_unlock)
-    parser_force_unlock.add_argument('tf_params', nargs=argparse.REMAINDER, help=tf_params_help)
-
-    parser_get = subparsers.add_parser('get', help='terraform get')
-    parser_get.set_defaults(func=terraform_get)
-    parser_get.add_argument('tf_params', nargs=argparse.REMAINDER, help=tf_params_help)
-
-    parser_graph = subparsers.add_parser('graph', help='terraform graph')
-    parser_graph.set_defaults(func=terraform_graph)
-    parser_graph.add_argument('tf_params', nargs=argparse.REMAINDER, help=tf_params_help)
-
-    parser_import = subparsers.add_parser('import', help='terraform import')
-    parser_import.set_defaults(func=terraform_import)
-    parser_import.add_argument('tf_params', nargs=argparse.REMAINDER, help=tf_params_help)
-
-    parser_init = subparsers.add_parser('init', help='terraform init')
-    parser_init.set_defaults(func=terraform_init)
-    parser_init.add_argument('tf_params', nargs=argparse.REMAINDER, help=tf_params_help)
-
-    parser_output = subparsers.add_parser('output', help='terraform output')
-    parser_output.set_defaults(func=terraform_output)
-    parser_output.add_argument('tf_params', nargs=argparse.REMAINDER, help=tf_params_help)
-
-    parser_plan = subparsers.add_parser('plan', help='terraform plan')
-    parser_plan.set_defaults(func=terraform_plan)
-    parser_plan.add_argument('tf_params', nargs=argparse.REMAINDER, help=tf_params_help)
-
-    parser_refresh = subparsers.add_parser('refresh', help='terraform refresh')
-    parser_refresh.set_defaults(func=terraform_refresh)
-    parser_refresh.add_argument('tf_params', nargs=argparse.REMAINDER, help=tf_params_help)
-
-    parser_show = subparsers.add_parser('show', help='terraform show')
-    parser_show.set_defaults(func=terraform_show)
-    parser_show.add_argument('tf_params', nargs=argparse.REMAINDER, help=tf_params_help)
-
-    parser_state = subparsers.add_parser('state', help='terraform state')
-    parser_state.set_defaults(func=terraform_state)
-    parser_state.add_argument('tf_params', nargs=argparse.REMAINDER, help=tf_params_help)
-
-    parser_taint = subparsers.add_parser('taint', help='terraform taint')
-    parser_taint.set_defaults(func=terraform_taint)
-    parser_taint.add_argument('tf_params', nargs=argparse.REMAINDER, help=tf_params_help)
-
-    parser_untaint = subparsers.add_parser('untaint', help='terraform untaint')
-    parser_untaint.set_defaults(func=terraform_untaint)
-    parser_untaint.add_argument('tf_params', nargs=argparse.REMAINDER, help=tf_params_help)
-
-    parser_validate = subparsers.add_parser('validate', help='terraform validate')
-    parser_validate.set_defaults(func=terraform_validate)
-    parser_validate.add_argument('tf_params', nargs=argparse.REMAINDER, help=tf_params_help)
-
-    parser_bootstrap = subparsers.add_parser('bootstrap', help='bootstrap configuration')
-    parser_bootstrap.set_defaults(func=bootstrap)
-    parser_bootstrap.add_argument('template', nargs='?', help='template to use during bootstrap', default=None)
-
-    parser_switchver = subparsers.add_parser('switchver', help='switch terraform version')
-    parser_switchver.set_defaults(func=switchver)
-    parser_switchver.add_argument('version', nargs=1, help='terraform version to use')
+    for subcommand in WRAPPER_SUBCOMMANDS:
+        parser_subcommand = subparsers.add_parser(subcommand, help='terraform {}'.format(subcommand))
+        parser_subcommand.set_defaults(func=getattr(sys.modules[__name__], "terraform_%s" % subcommand.replace('-', '_')))
+        parser_subcommand.add_argument('params', nargs=argparse.REMAINDER, help=params_help)
 
     args = parser.parse_args()
+    context = {}
 
-    if args.subcommand not in ('switchver',):
-        # process args
-        try:
-            wrapper_config = load_wrapper_config(args)
-        except ValueError as e:
-            print(e, file=sys.stderr)
-            sys.exit(RC_KO)
-        except Exception as e:
-            print('Unknown error :', file=sys.stderr)
-            print(e, file=sys.stderr)
-            sys.exit(RC_UNK)
+    # detect rootdir location
+    parents_list = ['application', 'environment', 'region', 'stack']
+    parents_count = 0
+    context['rootdir'] = None
+    while parents_count <= len(parents_list):
+        if os.path.isdir('../' * parents_count + args.confdir):
+            context['rootdir'] = os.path.abspath('../' * parents_count)
+            context['confdir'] = args.confdir
+            break
+        parents_count += 1
 
-        # load config
-        stack_config = load_stack_config(wrapper_config['confdir'],
-                                         wrapper_config['account'],
-                                         wrapper_config['environment'],
-                                         wrapper_config['region'],
-                                         wrapper_config['stack'])
+    if context['rootdir'] is None:
+        print("Cannot find configuration directory '{}' in this directory or above".format(args.confdir),
+              file=sys.stderr)
+        sys.exit(1)
+        
+    for element in parents_list:
+        context[element] = getattr(args, element)
 
-        # get sessions
-        print(colored('Getting state session', 'yellow'), file=sys.stderr)
-        state_session = get_session(wrapper_config['rootdir'],
-                                    wrapper_config['state_account'],
-                                    wrapper_config['state_region'],
-                                    wrapper_config['state_profile'])
+    # detect parent dirs
+    count_up = 0
+    count_down = parents_count
+    while count_down > 0:
+        element = parents_list[count_up]
+        if context[element] is None:
+            context[element] = os.path.basename(os.path.abspath('./' + '../' * (count_down - 1)))
+        count_down -= 1
+        count_up += 1
+        
+    for element in parents_list:
+        if context[element] is None:
+            print("{} cannot be autodetected. Exiting...".format(element),
+                  file=sys.stderr)
+            sys.exit(1)
 
-        if 'aws' in stack_config:
-            print(colored('Getting stack session', 'yellow'), file=sys.stderr)
-            stack_session = get_session(wrapper_config['rootdir'],
-                                        stack_config['aws']['general']['account'],
-                                        stack_config['aws']['general']['region'],
-                                        stack_config['aws']['credentials']['profile'])
+    # load state configuration
+    state_config_file = Path(context['rootdir'], context['confdir'], 'state.yml')
+    try:
+        with open(str(state_config_file), 'r') as f:
+            context['state_config'] = yaml.load(f)
+    except OSError as e:
+        print(colored('Failed to open file {}: {}'.format(state_config_file, e.strerror), 'red'), file=sys.stderr)
+        sys.exit(1)
 
-            # set terraform environment variables
-            stack_credentials = stack_session.get_credentials().get_frozen_credentials()
-            terraform_vars = stack_config['terraform']['vars']
-            terraform_vars['account'] = wrapper_config['account']
-            terraform_vars['environment'] = wrapper_config['environment']
-            terraform_vars['region'] = wrapper_config['region']
-            terraform_vars['stack'] = wrapper_config['stack']
-            terraform_vars['aws_access_key'] = stack_credentials.access_key
-            terraform_vars['aws_secret_key'] = stack_credentials.secret_key
-            terraform_vars['aws_token'] = stack_credentials.token
+    try:
+        Schema(WRAPPER_CONFIG_SCHEMA).validate(context['state_config'])
+    except SchemaError as e:
+        print(colored('Configuration error in {}:'.format(state_config_file), 'red'), file=sys.stderr)
+        print(e, file=sys.stderr)
+        sys.exit(1)
 
-        # Add support Azure
-        if 'azure' in stack_config:
-            terraform_vars = stack_config['terraform']['vars']
-            if 'client_name' not in terraform_vars:
-                terraform_vars['client_name'] = wrapper_config['account']
-            terraform_vars['environment'] = wrapper_config['environment']
-            terraform_vars['azurerm_region'] = wrapper_config['region'] # Kept for retro-compat
-            terraform_vars['azure_region'] = wrapper_config['region']
-            terraform_vars['stack'] = wrapper_config['stack']
-            terraform_vars['azure_subscription_id'] = stack_config['azure']['general']['subscription_id']
+    # load stack configuration
+    stack_config_file = Path(context['rootdir'], context['confdir'],
+                             '{}_{}_{}_{}.yml'.format(context['application'], context['environment'], context['region'], context['stack']))
+    try:
+        with open(str(stack_config_file), 'r') as f:
+            context['stack_config'] = yaml.load(f)
+    except OSError as e:
+        print(colored('Failed to open file {}: {}'.format(stack_config_file, e.strerror), 'red'), file=sys.stderr)
+        sys.exit(1)
 
-            az_login_mode = stack_config['azure']['general'].get('mode', 'user')
-            if az_login_mode.lower() == 'user':
-                print(colored('Using Azure user mode', 'yellow'))
+    try:
+        Schema(STACK_CONFIG_SCHEMA).validate(context['stack_config'])
+    except SchemaError as e:
+        print(colored('Configuration error in {}:'.format(stack_config_file), 'red'), file=sys.stderr)
+        print(e, file=sys.stderr)
+        sys.exit(1)
 
-                terraform_vars['azure_tenant_id'] = stack_config['azure']['general'].get('tenant_id',
-                                                                                         stack_config['azure']['general'].get('directory_id', None))
-                if not terraform_vars['azure_tenant_id']:
-                    print(colored('Please set the `azure.general.directory_id` variable in your stack configuration.', 'red'),
-                          file=sys.stderr)
-                    sys.exit(RC_KO)
-
-                azure_path = os.path.join(os.path.abspath(home_dir), '.azure')
-                if not os.path.exists(os.path.join(azure_path, 'accessTokens.json')):
-                    print(colored('Error : please run "az login"', 'red'), file=sys.stderr)
-                    sys.exit(RC_KO)
-
-                with open(os.path.join(azure_path, 'accessTokens.json'), 'r') as f1:
-                    try:
-                        access_token_obj = json.load(f1)
-                    except json.JSONDecodeError as errorloadjson:
-                        print(colored('Unexpected error while loading your accessTokens.json file :', 'red'),
-                              errorloadjson.msg)
-                        sys.exit(RC_KO)
-                    if access_token_obj is None or len(access_token_obj) == 0:
-                        print(colored('Error : you do not have access to these resources', 'red'),
-                              file=sys.stderr)
-                        sys.exit(RC_KO)
-
-                with codecs.open(os.path.join(azure_path, 'azureProfile.json'), 'r', 'utf-8-sig') as f2:
-                    try:
-                        azure_profile_obj = json.load(f2)
-                    except json.JSONDecodeError as errorloadprofile:
-                        print(colored('Unexpected error while loading your azureProfile.json file :', 'red'),
-                              errorloadprofile.msg)
-                        sys.exit(RC_KO)
-                    if terraform_vars['azure_subscription_id'] not in str(azure_profile_obj):
-                        print(colored('Error : your subscription did not match with your azure profiles,'
-                                      ' you may not have access to the subscription or try running "az login"', 'red'),
-                              file=sys.stderr)
-                        sys.exit(RC_KO)
-
-                if not datetime.strptime(access_token_obj[0]['expiresOn'], '%Y-%m-%d %H:%M:%S.%f') > datetime.now():
-                    print(colored('Error : your token is outdated, try running "az login"', 'red'),
-                          file=sys.stderr)
-                    sys.exit(RC_KO)
-
-                command = ['az', 'account', 'get-access-token']
-                az_token_process = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
-
-                if az_token_process.returncode == 0:
-                    result_json = str(az_token_process.stdout)
-                    az_token = json.loads(result_json)
-                    az_token_subscription = az_token['subscription']
-
-                    if az_token_subscription != terraform_vars['azure_subscription_id']:
-                        command = ['az', 'account', 'set', '--subscription', terraform_vars['azure_subscription_id']]
-                        az_account_process = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-                        if az_account_process.returncode != 0:
-                            print(colored('Could not switch to {} subscription : {}'.format(
-                                          terraform_vars['azure_subscription_id'], az_account_process.stderr.decode("utf-8")), 'red'),
-                                  file=sys.stderr)
-                            sys.exit(RC_KO)
-                        else:
-                            print(colored('Switched to {} subscription'.format(
-                                          terraform_vars['azure_subscription_id']), 'yellow'),
-                                  file=sys.stderr)
-                else:
-                    print(colored('Could not get an access token : {}'.format(az_token_process.stderr.decode("utf-8")), 'red'),
-                          file=sys.stderr)
-                    sys.exit(RC_KO)
-            elif az_login_mode.lower() in ['sp', 'serviceprincipal', 'service_principal']:
-                print(colored('Using Azure Service Principal mode', 'yellow'))
-
-                azure_config = open(os.path.abspath(home_dir) + '/.azurerm/config.yml')
-                load_azure_config = yaml.load(azure_config)
-                if load_azure_config is None:
-                    print(colored('Please configure your ~/.azurerm/config.yml configuration file', 'red'), file=sys.stderr)
-                    sys.exit(RC_KO)
-                profile = stack_config['azure']['credential']['profile']
-                if profile not in load_azure_config.keys():
-                    print(colored('Cannot find "{}" profile in your ~/.azurerm/config.yml configuration file'.format(profile), 'red'),
-                          file=sys.stderr)
-                    sys.exit(RC_KO)
-
-                terraform_vars['azure_tenant_id'] = load_azure_config[profile]['tenant_id']
-
-                os.environ['ARM_CLIENT_ID'] = load_azure_config[profile]['client_id']
-                os.environ['ARM_CLIENT_SECRET'] = load_azure_config[profile]['client_secret']
-            else:
-                print(colored('Please use a correct Azure authentication mode ("user" or "service_principal") in your stack YAML configuration.', 'red'), file=sys.stderr)
-                sys.exit(RC_KO)
-
-        set_terraform_vars(terraform_vars)
-        os.environ['TF_PLUGIN_CACHE_DIR'] = wrapper_config['plugin_cache_dir']
-
-        # set AWS state centralization environment variables
+    
+    print(colored('Getting state session', 'yellow'), file=sys.stderr)
+    try:
+        state_session = get_cached_session(profile_name=context['state_config']['profile'])
         state_credentials = state_session.get_credentials().get_frozen_credentials()
-        os.environ['AWS_ACCESS_KEY_ID'] = state_credentials.access_key
-        os.environ['AWS_SECRET_ACCESS_KEY'] = state_credentials.secret_key
-        os.environ['AWS_SESSION_TOKEN'] = state_credentials.token
+    except (ClientError, ProfileNotFound) as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+
+    os.environ['AWS_ACCESS_KEY_ID'] = state_credentials.access_key
+    os.environ['AWS_SECRET_ACCESS_KEY'] = state_credentials.secret_key
+    os.environ['AWS_SESSION_TOKEN'] = state_credentials.token
+
+    print(colored('Getting stack session', 'yellow'), file=sys.stderr)
+    try:
+        stack_session = get_cached_session(profile_name=context['stack_config']['profile'])
+        stack_credentials = stack_session.get_credentials().get_frozen_credentials()
+        stack_identity = stack_session.client('sts').get_caller_identity()
+    except (ClientError, ProfileNotFound) as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+
+    if 'terraform' in context['stack_config']:
+        if 'vars' in context['stack_config']['terraform']:
+            terraform_vars = context['stack_config']['terraform']['vars']
     else:
-        wrapper_config = deepcopy(vars(args))
+        terraform_vars = dict()
+    terraform_vars['partition'] = context['stack_config']['partition']
+    terraform_vars['application'] = context['application']
+    terraform_vars['environment'] = context['environment']
+    terraform_vars['aws_region'] = context['region']
+    terraform_vars['stack'] = context['stack']
+    terraform_vars['aws_access_key'] = stack_credentials.access_key
+    terraform_vars['aws_secret_key'] = stack_credentials.secret_key
+    terraform_vars['aws_token'] = stack_credentials.token
+    terraform_vars['aws_account'] = stack_identity['Account']
+
+    for k,v in terraform_vars.items():
+        if v is not None:
+            os.environ['TF_VAR_{}'.format(k)] = str(v)
 
     # call subcommand
-    returncode = None
-
+    returncode = 0
     if hasattr(args, 'func'):
-        returncode = args.func(wrapper_config)
+        context['params'] = args.params
+        returncode = args.func(context)
     else:
         parser.print_help(file=sys.stderr)
 
-    if returncode is not None:
-        sys.exit(returncode)
-    else:
-        sys.exit(RC_OK)
-
-
+    sys.exit(returncode)
+            
 if __name__ == "__main__":
     main()
