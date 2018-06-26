@@ -8,6 +8,7 @@ Notable differences with upstream :
   * Simplify stack schema
   * Determine AWS account ID with sts:GetCallerIdentity
   * Get closer to Terraform native behavior (only init and get subcommands are slightly different)
+  * Reimplement AWS credentials caching (see https://github.com/boto/botocore/pull/1338/)
   * Remove azure support
   * Remove terrafom versionning support
 
