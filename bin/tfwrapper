@@ -305,13 +305,15 @@ def main():
         sys.exit(1)
 
     try:
-        Schema(STACK_CONFIG_SCHEMA).validate(context['stack_config'])
+        schema = STACK_CONFIG_SCHEMA
+        if context['region'] == 'global':
+            schema['region'] = str
+        Schema(schema).validate(context['stack_config'])
     except SchemaError as e:
         print(colored('Configuration error in {}:'.format(stack_config_file), 'red'), file=sys.stderr)
         print(e, file=sys.stderr)
         sys.exit(1)
 
-    
     print(colored('Getting state session', 'yellow'), file=sys.stderr)
     try:
         state_session = get_cached_session(profile_name=context['state_config']['profile'])
@@ -341,7 +343,12 @@ def main():
     terraform_vars['partition'] = context['stack_config']['partition']
     terraform_vars['application'] = context['application']
     terraform_vars['environment'] = context['environment']
-    terraform_vars['aws_region'] = context['region']
+
+    if context['region'] == 'global':
+        terraform_vars['aws_region'] = context['stack_config']['region']
+    else:
+        terraform_vars['aws_region'] = context['region']
+
     terraform_vars['stack'] = context['stack']
     terraform_vars['aws_access_key'] = stack_credentials.access_key
     terraform_vars['aws_secret_key'] = stack_credentials.secret_key
